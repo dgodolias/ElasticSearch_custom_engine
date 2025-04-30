@@ -2,6 +2,16 @@ import json
 import os
 from elasticsearch import Elasticsearch
 from tqdm import tqdm
+import ssl
+import urllib3
+from dotenv import load_dotenv
+import time
+
+# Φόρτωση μεταβλητών περιβάλλοντος από το .env αρχείο
+load_dotenv()
+
+# Απενεργοποίηση προειδοποιήσεων για μη επαληθευμένα SSL
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Διαδρομές για τα αρχεία της συλλογής
 CORPUS_PATH = "covid_datasets/corpus.jsonl"
@@ -10,21 +20,94 @@ QRELS_PATH = "covid_datasets/qrels/test.tsv"
 
 # Ρυθμίσεις ElasticSearch
 INDEX_NAME = "covid_search"
-ES_HOST = "http://localhost:9200"
+ES_HOST = "https://localhost:9200"  # Χρήση HTTPS αντί για HTTP
+ES_USER = os.getenv("ES_USER", "")  # Αφήνουμε κενό για σύνδεση χωρίς auth
+ES_PASS = os.getenv("ES_PASS", "")
+ES_TIMEOUT = 30  # Timeout σε δευτερόλεπτα
 
 class ElasticSearchEngine:
     def __init__(self, host=ES_HOST):
         """Αρχικοποίηση του ElasticSearch client"""
-        self.es = Elasticsearch(host)
-        self.index_name = INDEX_NAME
+        # Δημιουργία SSL context για ασφαλή σύνδεση
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
         
+        # Σύνδεση με διαπιστευτήρια (βασική στρατηγική)
+        if ES_USER and ES_PASS:
+            try:
+                self.es = Elasticsearch(
+                    host,
+                    basic_auth=(ES_USER, ES_PASS),
+                    verify_certs=False,
+                    ssl_context=ssl_context,
+                    request_timeout=ES_TIMEOUT
+                )
+                print("Επιτυχής σύνδεση με τον ElasticSearch με διαπιστευτήρια")
+            except Exception as e:
+                print(f"Αποτυχία σύνδεσης με διαπιστευτήρια: {e}")
+                raise ConnectionError("Δεν ήταν δυνατή η σύνδεση με τον ElasticSearch server")
+        else:
+            # Εναλλακτική προσπάθεια σύνδεσης χωρίς διαπιστευτήρια
+            try:
+                self.es = Elasticsearch(
+                    host,
+                    verify_certs=False,
+                    ssl_context=ssl_context,
+                    request_timeout=ES_TIMEOUT
+                )
+                print("Επιτυχής σύνδεση με τον ElasticSearch με SSL αλλά χωρίς διαπιστευτήρια")
+            except Exception as e:
+                print(f"Αποτυχία σύνδεσης: {e}")
+                raise ConnectionError("Δεν ήταν δυνατή η σύνδεση με τον ElasticSearch server")
+        
+        self.index_name = INDEX_NAME
+    
     def check_connection(self):
         """Έλεγχος σύνδεσης με τον ElasticSearch server"""
         try:
-            return self.es.ping()
+            info = self.es.info()
+            print(f"Έκδοση ElasticSearch: {info.get('version', {}).get('number', 'unknown')}")
+            return True
         except Exception as e:
             print(f"Σφάλμα σύνδεσης με τον ElasticSearch: {e}")
             return False
+    
+    def count_corpus_documents(self, corpus_path):
+        """Μέτρηση του αριθμού των εγγράφων στο αρχείο corpus"""
+        if not os.path.exists(corpus_path):
+            raise FileNotFoundError(f"Το αρχείο {corpus_path} δε βρέθηκε")
+        
+        with open(corpus_path, 'r', encoding='utf-8') as f:
+            # Μέτρηση των γραμμών στο αρχείο
+            doc_count = sum(1 for _ in f)
+        
+        return doc_count
+    
+    def index_exists_and_complete(self, corpus_path):
+        """Έλεγχος αν το ευρετήριο υπάρχει και περιέχει όλα τα έγγραφα του corpus"""
+        if not self.es.indices.exists(index=self.index_name):
+            return False
+        
+        # Μέτρηση εγγράφων στο ευρετήριο
+        count_result = self.es.count(index=self.index_name)
+        indexed_doc_count = count_result.get('count', 0)
+        
+        # Μέτρηση εγγράφων στο αρχείο corpus
+        corpus_doc_count = self.count_corpus_documents(corpus_path)
+        
+        if indexed_doc_count > 0:
+            print(f"Το ευρετήριο {self.index_name} υπάρχει ήδη και περιέχει {indexed_doc_count} έγγραφα από σύνολο {corpus_doc_count}.")
+            
+            # Έλεγχος αν όλα τα έγγραφα έχουν εισαχθεί
+            if indexed_doc_count >= corpus_doc_count:
+                print("Το ευρετήριο περιέχει όλα τα έγγραφα του corpus!")
+                return True
+            else:
+                print(f"Το ευρετήριο είναι ελλιπές. Λείπουν {corpus_doc_count - indexed_doc_count} έγγραφα.")
+                # Προτείνουμε επανεισαγωγή
+                return False
+        return False
     
     def create_index(self, delete_if_exists=True):
         """Δημιουργία ευρετηρίου"""
@@ -172,11 +255,13 @@ def main():
         print("Δεν είναι δυνατή η σύνδεση με τον ElasticSearch server. Βεβαιωθείτε ότι ο server είναι σε λειτουργία.")
         return
     
-    # Δημιουργία ευρετηρίου
-    es_engine.create_index()
-    
-    # Εισαγωγή εγγράφων στο ευρετήριο
-    es_engine.index_documents(CORPUS_PATH)
+    # Έλεγχος αν το ευρετήριο υπάρχει ήδη και περιέχει έγγραφα
+    if not es_engine.index_exists_and_complete(CORPUS_PATH):
+        # Δημιουργία ευρετηρίου μόνο αν δεν υπάρχει ή είναι κενό
+        es_engine.create_index()
+        
+        # Εισαγωγή εγγράφων στο ευρετήριο
+        es_engine.index_documents(CORPUS_PATH)
     
     # Εκτέλεση αναζήτησης για όλα τα ερωτήματα
     for k in [20, 30, 50]:
