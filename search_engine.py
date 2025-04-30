@@ -1,12 +1,12 @@
 import json
 import os
-from elasticsearch import Elasticsearch, helpers # Import helpers
+from elasticsearch import Elasticsearch, helpers
 from tqdm import tqdm
 import ssl
 import urllib3
 from dotenv import load_dotenv
 import time
-import threading # Import threading for parallel_bulk
+import threading
 
 # Φόρτωση μεταβλητών περιβάλλοντος από το .env αρχείο
 load_dotenv()
@@ -111,28 +111,55 @@ class ElasticSearchEngine:
         return False
     
     def create_index(self, delete_if_exists=True):
-        """Δημιουργία ευρετηρίου"""
+        """Δημιουργία ευρετηρίου με βελτιστοποιημένες ρυθμίσεις"""
         if delete_if_exists and self.es.indices.exists(index=self.index_name):
             print(f"Διαγραφή υπάρχοντος ευρετηρίου: {self.index_name}")
             self.es.indices.delete(index=self.index_name)
         
-        # Ορισμός των ρυθμίσεων του ευρετηρίου
+        # Βελτιστοποιημένες ρυθμίσεις του ευρετηρίου
         settings = {
             "settings": {
                 "analysis": {
+                    "filter": {
+                        "english_stop": {
+                            "type": "stop",
+                            "stopwords": "_english_"
+                        },
+                        "english_stemmer": {
+                            "type": "stemmer",
+                            "language": "english"
+                        },
+                        "english_possessive_stemmer": {
+                            "type": "stemmer",
+                            "language": "possessive_english"
+                        },
+                        # Φίλτρο για ιατρικούς όρους - θα διατηρήσει αντί να κόψει κοινά ιατρικά προθέματα
+                        "medical_prefix_filter": {
+                            "type": "pattern_replace",
+                            "pattern": "^(covid|sars|corona|virus|pneumonia)",
+                            "replacement": "$1"
+                        }
+                    },
                     "analyzer": {
                         "custom_analyzer": {
                             "type": "custom",
                             "tokenizer": "standard",
-                            "filter": ["lowercase", "stop", "snowball"]
+                            "filter": [
+                                "lowercase",
+                                "english_possessive_stemmer",
+                                "english_stop",
+                                "english_stemmer",
+                                "medical_prefix_filter"
+                            ]
                         }
                     }
                 },
                 "similarity": {
                     "custom_similarity": {
                         "type": "BM25",
-                        "b": 0.75,
-                        "k1": 1.2
+                        # Βελτιστοποιημένες παράμετροι για ιατρικά κείμενα
+                        "b": 0.5,         # Μειώνουμε το b για να μειωθεί η επιρροή του μήκους εγγράφου
+                        "k1": 1.6         # Αυξάνουμε το k1 για καλύτερο χειρισμό επαναλαμβανόμενων όρων
                     }
                 }
             },
@@ -141,17 +168,20 @@ class ElasticSearchEngine:
                     "title": {
                         "type": "text",
                         "analyzer": "custom_analyzer",
-                        "similarity": "custom_similarity"
+                        "similarity": "custom_similarity",
+                        "boost": 3.0      # Δίνουμε μεγαλύτερο βάρος στον τίτλο
                     },
                     "abstract": {
                         "type": "text",
                         "analyzer": "custom_analyzer",
-                        "similarity": "custom_similarity"
+                        "similarity": "custom_similarity",
+                        "boost": 2.0      # Δίνουμε μεσαίο βάρος στην περίληψη
                     },
                     "body_text": {
                         "type": "text",
                         "analyzer": "custom_analyzer",
-                        "similarity": "custom_similarity"
+                        "similarity": "custom_similarity",
+                        "boost": 1.0      # Κανονικό βάρος στο κυρίως κείμενο
                     },
                     "doc_id": {
                         "type": "keyword"
@@ -182,7 +212,7 @@ class ElasticSearchEngine:
                     }
                 }
 
-    def index_documents(self, corpus_path, chunk_size=500, max_chunk_bytes=100*1024*1024, thread_count=4):
+    def index_documents(self, corpus_path, chunk_size=500, max_chunk_bytes=100*1024*1024, thread_count=8):
         """Εισαγωγή εγγράφων στο ευρετήριο χρησιμοποιώντας το parallel_bulk helper."""
         print(f"Εισαγωγή εγγράφων από το αρχείο: {corpus_path} χρησιμοποιώντας parallel_bulk")
         
@@ -233,15 +263,19 @@ class ElasticSearchEngine:
         return body_text
     
     def search(self, query_text, k=20):
-        """Αναζήτηση με βάση το κείμενο του ερωτήματος"""
+        """Αναζήτηση με βάση το κείμενο του ερωτήματος - Βελτιωμένη έκδοση"""
         query = {
             "query": {
                 "multi_match": {
                     "query": query_text,
-                    "fields": ["title^2", "abstract^1.5", "body_text"],
-                    "type": "best_fields"
+                    "fields": ["title^3", "abstract^2", "body_text^1"],
+                    "type": "cross_fields",  # Αναζήτηση σε όλα τα πεδία ταυτόχρονα
+                    "tie_breaker": 0.3,      # Αύξηση της επιρροής των λιγότερο σημαντικών πεδίων
+                    "operator": "or",
+                    "minimum_should_match": "70%"  # Τουλάχιστον 70% των όρων πρέπει να ταιριάζουν
                 }
             },
+            "_source": ["doc_id", "title"],
             "size": k
         }
         
@@ -295,10 +329,10 @@ def main():
     if not es_engine.index_exists_and_complete(CORPUS_PATH):
         # Δημιουργία ευρετηρίου μόνο αν δεν υπάρχει ή είναι ελλιπές
         print("Το ευρετήριο δεν υπάρχει ή είναι ελλιπές. Δημιουργία/Επανεισαγωγή...")
-        es_engine.create_index(delete_if_exists=True) # Διαγραφή αν υπάρχει για να εξασφαλιστεί η πληρότητα
+        es_engine.create_index(delete_if_exists=True)
         
         # Εισαγωγή εγγράφων στο ευρετήριο με parallel_bulk
-        es_engine.index_documents(CORPUS_PATH) # Οι παράμετροι chunk_size, thread_count κλπ έχουν default τιμές
+        es_engine.index_documents(CORPUS_PATH, thread_count=8)  # Αύξηση των threads για ταχύτερη εισαγωγή
     else:
         print("Το ευρετήριο υπάρχει και είναι πλήρες. Παράλειψη δημιουργίας/εισαγωγής.")
 
