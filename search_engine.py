@@ -168,20 +168,17 @@ class ElasticSearchEngine:
                     "title": {
                         "type": "text",
                         "analyzer": "custom_analyzer",
-                        "similarity": "custom_similarity",
-                        "boost": 3.0      # Δίνουμε μεγαλύτερο βάρος στον τίτλο
+                        "similarity": "custom_similarity"
                     },
                     "abstract": {
                         "type": "text",
                         "analyzer": "custom_analyzer",
-                        "similarity": "custom_similarity",
-                        "boost": 2.0      # Δίνουμε μεσαίο βάρος στην περίληψη
+                        "similarity": "custom_similarity"
                     },
                     "body_text": {
                         "type": "text",
                         "analyzer": "custom_analyzer",
-                        "similarity": "custom_similarity",
-                        "boost": 1.0      # Κανονικό βάρος στο κυρίως κείμενο
+                        "similarity": "custom_similarity"
                     },
                     "doc_id": {
                         "type": "keyword"
@@ -325,16 +322,12 @@ def main():
         print("Δεν είναι δυνατή η σύνδεση με τον ElasticSearch server. Βεβαιωθείτε ότι ο server είναι σε λειτουργία.")
         return
     
-    # Έλεγχος αν το ευρετήριο υπάρχει ήδη και περιέχει έγγραφα
-    if not es_engine.index_exists_and_complete(CORPUS_PATH):
-        # Δημιουργία ευρετηρίου μόνο αν δεν υπάρχει ή είναι ελλιπές
-        print("Το ευρετήριο δεν υπάρχει ή είναι ελλιπές. Δημιουργία/Επανεισαγωγή...")
-        es_engine.create_index(delete_if_exists=True)
-        
-        # Εισαγωγή εγγράφων στο ευρετήριο με parallel_bulk
-        es_engine.index_documents(CORPUS_PATH, thread_count=8)  # Αύξηση των threads για ταχύτερη εισαγωγή
-    else:
-        print("Το ευρετήριο υπάρχει και είναι πλήρες. Παράλειψη δημιουργίας/εισαγωγής.")
+    # Πάντα δημιουργία/επανεισαγωγή του ευρετηρίου
+    print("Δημιουργία/Επανεισαγωγή ευρετηρίου...")
+    es_engine.create_index(delete_if_exists=True)
+    
+    # Εισαγωγή εγγράφων στο ευρετήριο με parallel_bulk
+    es_engine.index_documents(CORPUS_PATH, thread_count=8)  # Αύξηση των threads για ταχύτερη εισαγωγή
 
     # Εκτέλεση αναζήτησης για όλα τα ερωτήματα
     for k in [20, 30, 50]:
