@@ -196,18 +196,27 @@ class ElasticSearchEngine:
         if not os.path.exists(corpus_path):
             raise FileNotFoundError(f"Το αρχείο {corpus_path} δε βρέθηκε")
             
+        print_count = 0 # Μετρητής για εκτύπωση
         with open(corpus_path, 'r', encoding='utf-8') as f:
             for line in f:
                 doc = json.loads(line)
-                yield {
+                action = {
                     "_index": self.index_name,
                     "_source": {
                         "title": doc.get("title", ""),
                         "abstract": doc.get("abstract", ""),
-                        "body_text": self._extract_body_text(doc),
+                        "body_text": doc.get("text", ""),
                         "doc_id": doc.get("_id", "")
                     }
                 }
+                
+                # Εκτύπωση των πρώτων 3 εγγράφων
+                if print_count < 3:
+                    print("--- Έγγραφο προς εισαγωγή ---")
+                    print(json.dumps(action, indent=2, ensure_ascii=False))
+                    print_count += 1
+                    
+                yield action
 
     def index_documents(self, corpus_path, chunk_size=500, max_chunk_bytes=100*1024*1024, thread_count=8):
         """Εισαγωγή εγγράφων στο ευρετήριο χρησιμοποιώντας το parallel_bulk helper."""
@@ -252,13 +261,6 @@ class ElasticSearchEngine:
         if fail_count > 0:
              print("Υπήρξαν αποτυχίες κατά την εισαγωγή. Ελέγξτε τα παραπάνω μηνύματα.")
 
-    def _extract_body_text(self, doc):
-        """Εξαγωγή του κειμένου από την ενότητα body_text"""
-        body_text = ""
-        if "body_text" in doc and isinstance(doc["body_text"], list):
-            body_text = " ".join([entry.get("text", "") for entry in doc["body_text"]])
-        return body_text
-    
     def search(self, query_text, k=20):
         """Αναζήτηση με βάση το κείμενο του ερωτήματος - Βελτιωμένη έκδοση"""
         query = {
@@ -284,11 +286,18 @@ class ElasticSearchEngine:
         if not os.path.exists(queries_path):
             raise FileNotFoundError(f"Το αρχείο {queries_path} δε βρέθηκε")
         
+        results = {}
+        print_count = 0 # Μετρητής για εκτύπωση
         with open(queries_path, 'r', encoding='utf-8') as f:
             queries = [json.loads(line) for line in f]
-        
-        results = {}
+            
         for query in tqdm(queries, desc="Εκτέλεση ερωτημάτων"):
+            # Εκτύπωση των πρώτων 3 queries
+            if print_count < 3:
+                print("--- Ερώτημα προς εκτέλεση ---")
+                print(json.dumps(query, indent=2, ensure_ascii=False))
+                print_count += 1
+                
             query_id = query.get("_id", "")
             query_text = query.get("text", "")
             
