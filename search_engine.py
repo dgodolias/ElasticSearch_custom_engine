@@ -63,6 +63,8 @@ class ElasticSearchEngine:
                 raise ConnectionError("Δεν ήταν δυνατή η σύνδεση με τον ElasticSearch server")
         
         self.index_name = INDEX_NAME
+        self._analysis_print_count = 0 # Μετρητής για έγγραφα
+        self._query_analysis_print_count = 0 # Μετρητής για ερωτήματα
     
     def check_connection(self):
         """Έλεγχος σύνδεσης με τον ElasticSearch server"""
@@ -170,11 +172,6 @@ class ElasticSearchEngine:
                         "analyzer": "custom_analyzer",
                         "similarity": "custom_similarity"
                     },
-                    "abstract": {
-                        "type": "text",
-                        "analyzer": "custom_analyzer",
-                        "similarity": "custom_similarity"
-                    },
                     "body_text": {
                         "type": "text",
                         "analyzer": "custom_analyzer",
@@ -191,6 +188,33 @@ class ElasticSearchEngine:
         self.es.indices.create(index=self.index_name, body=settings)
         print("Το ευρετήριο δημιουργήθηκε επιτυχώς!")
     
+    def _save_analysis_to_file(self, data, filename_prefix, stage):
+        """Αποθηκεύει δεδομένα (πριν/μετά την ανάλυση) σε αρχείο."""
+        filepath = os.path.join("results", f"{filename_prefix}_{stage}.txt")
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            # print(f"Αποθηκεύτηκε: {filepath}") # Προαιρετική εκτύπωση επιβεβαίωσης
+        except Exception as e:
+            print(f"Σφάλμα κατά την αποθήκευση στο {filepath}: {e}")
+
+    def _analyze_text(self, text, field_name="text"):
+        """Χρησιμοποιεί το Analyze API για να πάρει τα tokens."""
+        if not text: # Αν το κείμενο είναι κενό, μην καλείς το analyze
+            return []
+        try:
+            response = self.es.indices.analyze(
+                index=self.index_name, 
+                body={
+                    "analyzer": "custom_analyzer",
+                    "text": text
+                }
+            )
+            return [token_info['token'] for token_info in response.get('tokens', [])]
+        except Exception as e:
+            print(f"Σφάλμα κατά την ανάλυση του πεδίου '{field_name}': {e}")
+            return [f"ΣΦΑΛΜΑ ΑΝΑΛΥΣΗΣ: {e}"]
+
     def _generate_bulk_actions(self, corpus_path):
         """Generator function to yield bulk actions for indexing."""
         if not os.path.exists(corpus_path):
@@ -200,22 +224,35 @@ class ElasticSearchEngine:
         with open(corpus_path, 'r', encoding='utf-8') as f:
             for line in f:
                 doc = json.loads(line)
+                doc_id = doc.get("_id", "")
+                title = doc.get("title", "")
+                body_text_original = doc.get("text", "")
+                
                 action = {
                     "_index": self.index_name,
                     "_source": {
-                        "title": doc.get("title", ""),
-                        "abstract": doc.get("abstract", ""),
-                        "body_text": doc.get("text", ""),
-                        "doc_id": doc.get("_id", "")
+                        "title": title,
+                        "body_text": body_text_original, # Χρησιμοποιούμε το αρχικό text ως body_text
+                        "doc_id": doc_id
                     }
                 }
                 
-                # Εκτύπωση των πρώτων 3 εγγράφων
-                if print_count < 3:
-                    print("--- Έγγραφο προς εισαγωγή ---")
-                    print(json.dumps(action, indent=2, ensure_ascii=False))
-                    print_count += 1
                     
+                # Αποθήκευση πριν/μετά την ανάλυση για τα πρώτα 3 έγγραφα
+                if self._analysis_print_count < 3:
+                    filename_prefix = f"doc_{doc_id}"
+                    # Αποθήκευση πριν
+                    self._save_analysis_to_file(action, filename_prefix, "before")
+                    
+                    # Ανάλυση και αποθήκευση μετά
+                    analysis_after = {
+                        "title_tokens": self._analyze_text(title, "title"),
+                        "body_text_tokens": self._analyze_text(body_text_original, "body_text")
+                    }
+                    self._save_analysis_to_file(analysis_after, filename_prefix, "after")
+                    
+                    self._analysis_print_count += 1
+
                 yield action
 
     def index_documents(self, corpus_path, chunk_size=500, max_chunk_bytes=100*1024*1024, thread_count=8):
@@ -267,7 +304,7 @@ class ElasticSearchEngine:
             "query": {
                 "multi_match": {
                     "query": query_text,
-                    "fields": ["title^3", "abstract^2", "body_text^1"],
+                    "fields": ["title^3", "body_text^1"],
                     "type": "cross_fields",  # Αναζήτηση σε όλα τα πεδία ταυτόχρονα
                     "tie_breaker": 0.3,      # Αύξηση της επιρροής των λιγότερο σημαντικών πεδίων
                     "operator": "or",
@@ -292,15 +329,25 @@ class ElasticSearchEngine:
             queries = [json.loads(line) for line in f]
             
         for query in tqdm(queries, desc="Εκτέλεση ερωτημάτων"):
-            # Εκτύπωση των πρώτων 3 queries
-            if print_count < 3:
-                print("--- Ερώτημα προς εκτέλεση ---")
-                print(json.dumps(query, indent=2, ensure_ascii=False))
-                print_count += 1
+
                 
             query_id = query.get("_id", "")
             query_text = query.get("text", "")
             
+            # Αποθήκευση πριν/μετά την ανάλυση για τα πρώτα 3 ερωτήματα
+            if self._query_analysis_print_count < 3:
+                 filename_prefix = f"query_{query_id}"
+                 # Αποθήκευση πριν
+                 self._save_analysis_to_file(query, filename_prefix, "before")
+                 
+                 # Ανάλυση και αποθήκευση μετά
+                 analysis_after = {
+                     "query_text_tokens": self._analyze_text(query_text, "query_text")
+                 }
+                 self._save_analysis_to_file(analysis_after, filename_prefix, "after")
+                 
+                 self._query_analysis_print_count += 1
+
             search_results = self.search(query_text, k=k)
             results[query_id] = search_results
         
