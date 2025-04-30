@@ -1,11 +1,12 @@
 import json
 import os
-from elasticsearch import Elasticsearch
+from elasticsearch import Elasticsearch, helpers # Import helpers
 from tqdm import tqdm
 import ssl
 import urllib3
 from dotenv import load_dotenv
 import time
+import threading # Import threading for parallel_bulk
 
 # Φόρτωση μεταβλητών περιβάλλοντος από το .env αρχείο
 load_dotenv()
@@ -163,32 +164,67 @@ class ElasticSearchEngine:
         self.es.indices.create(index=self.index_name, body=settings)
         print("Το ευρετήριο δημιουργήθηκε επιτυχώς!")
     
-    def index_documents(self, corpus_path):
-        """Εισαγωγή εγγράφων στο ευρετήριο"""
+    def _generate_bulk_actions(self, corpus_path):
+        """Generator function to yield bulk actions for indexing."""
         if not os.path.exists(corpus_path):
             raise FileNotFoundError(f"Το αρχείο {corpus_path} δε βρέθηκε")
-        
-        print(f"Εισαγωγή εγγράφων από το αρχείο: {corpus_path}")
-        with open(corpus_path, 'r', encoding='utf-8') as f:
-            corpus = [json.loads(line) for line in f]
-        
-        # Εισαγωγή των εγγράφων στο ευρετήριο
-        count = 0
-        for doc in tqdm(corpus, desc="Εισαγωγή εγγράφων"):
-            document = {
-                "title": doc.get("title", ""),
-                "abstract": doc.get("abstract", ""),
-                "body_text": self._extract_body_text(doc),
-                "doc_id": doc.get("_id", "")
-            }
             
-            self.es.index(index=self.index_name, document=document)
-            count += 1
+        with open(corpus_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                doc = json.loads(line)
+                yield {
+                    "_index": self.index_name,
+                    "_source": {
+                        "title": doc.get("title", ""),
+                        "abstract": doc.get("abstract", ""),
+                        "body_text": self._extract_body_text(doc),
+                        "doc_id": doc.get("_id", "")
+                    }
+                }
+
+    def index_documents(self, corpus_path, chunk_size=500, max_chunk_bytes=100*1024*1024, thread_count=4):
+        """Εισαγωγή εγγράφων στο ευρετήριο χρησιμοποιώντας το parallel_bulk helper."""
+        print(f"Εισαγωγή εγγράφων από το αρχείο: {corpus_path} χρησιμοποιώντας parallel_bulk")
         
+        # Μέτρηση του συνολικού αριθμού εγγράφων για το tqdm
+        total_docs = self.count_corpus_documents(corpus_path)
+        
+        # Χρήση του parallel_bulk για ταχύτερη εισαγωγή με threads
+        progress = tqdm(unit="docs", total=total_docs, desc="Εισαγωγή εγγράφων (parallel_bulk)")
+        success_count = 0
+        fail_count = 0
+        
+        try:
+            # Το parallel_bulk επιστρέφει ένα generator με τα αποτελέσματα
+            for success, info in helpers.parallel_bulk(
+                client=self.es,
+                actions=self._generate_bulk_actions(corpus_path),
+                thread_count=thread_count, # Αριθμός threads
+                chunk_size=chunk_size, # Αριθμός εγγράφων ανά chunk
+                max_chunk_bytes=max_chunk_bytes, # Μέγιστο μέγεθος chunk σε bytes
+                raise_on_error=False, # Συνέχεια ακόμα και αν υπάρχουν σφάλματα
+                raise_on_exception=False # Συνέχεια ακόμα και αν υπάρχουν exceptions
+            ):
+                if success:
+                    success_count += 1
+                else:
+                    fail_count += 1
+                    print(f"Αποτυχία εισαγωγής εγγράφου: {info}") # Εκτύπωση σφάλματος
+                progress.update(1) # Ενημέρωση του progress bar
+                
+        except Exception as e:
+            print(f"Προέκυψε σφάλμα κατά τη διάρκεια του parallel_bulk: {e}")
+        finally:
+            progress.close() # Κλείσιμο του progress bar
+
         # Ανανέωση του ευρετηρίου για να είναι διαθέσιμα τα έγγραφα για αναζήτηση
+        print("Ανανέωση ευρετηρίου...")
         self.es.indices.refresh(index=self.index_name)
-        print(f"Εισήχθησαν επιτυχώς {count} έγγραφα στο ευρετήριο!")
-    
+        
+        print(f"Ολοκληρώθηκε η εισαγωγή. Επιτυχίες: {success_count}, Αποτυχίες: {fail_count}")
+        if fail_count > 0:
+             print("Υπήρξαν αποτυχίες κατά την εισαγωγή. Ελέγξτε τα παραπάνω μηνύματα.")
+
     def _extract_body_text(self, doc):
         """Εξαγωγή του κειμένου από την ενότητα body_text"""
         body_text = ""
@@ -257,12 +293,15 @@ def main():
     
     # Έλεγχος αν το ευρετήριο υπάρχει ήδη και περιέχει έγγραφα
     if not es_engine.index_exists_and_complete(CORPUS_PATH):
-        # Δημιουργία ευρετηρίου μόνο αν δεν υπάρχει ή είναι κενό
-        es_engine.create_index()
+        # Δημιουργία ευρετηρίου μόνο αν δεν υπάρχει ή είναι ελλιπές
+        print("Το ευρετήριο δεν υπάρχει ή είναι ελλιπές. Δημιουργία/Επανεισαγωγή...")
+        es_engine.create_index(delete_if_exists=True) # Διαγραφή αν υπάρχει για να εξασφαλιστεί η πληρότητα
         
-        # Εισαγωγή εγγράφων στο ευρετήριο
-        es_engine.index_documents(CORPUS_PATH)
-    
+        # Εισαγωγή εγγράφων στο ευρετήριο με parallel_bulk
+        es_engine.index_documents(CORPUS_PATH) # Οι παράμετροι chunk_size, thread_count κλπ έχουν default τιμές
+    else:
+        print("Το ευρετήριο υπάρχει και είναι πλήρες. Παράλειψη δημιουργίας/εισαγωγής.")
+
     # Εκτέλεση αναζήτησης για όλα τα ερωτήματα
     for k in [20, 30, 50]:
         print(f"\nΕκτέλεση αναζήτησης για τα top-{k} αποτελέσματα...")
