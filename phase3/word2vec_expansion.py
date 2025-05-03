@@ -8,6 +8,7 @@ import nltk
 from nltk.tokenize import word_tokenize
 from nltk.corpus import stopwords
 from nltk.tag import pos_tag
+from nltk.stem import PorterStemmer # <-- Προσθήκη import
 import gensim
 from gensim.models import Word2Vec
 import logging
@@ -147,48 +148,72 @@ def get_similar_words(model, word, topn=5, threshold=0.5):
     return similar_words
 
 # Αναγνώριση επεκτάσιμων λέξεων και εύρεση παρόμοιων από Word2Vec
-def get_expandable_words_and_similar(query_text, model, topn=3, threshold=0.6, min_word_length=4):
+def get_expandable_words_and_similar(query_text, model, topn=3, threshold=0.8, min_word_length=4):
     """
-    Αναγνώριση σημαντικών λέξεων στο ερώτημα και εύρεση παρόμοιων λέξεων με Word2Vec
-    
+    Αναγνώριση σημαντικών λέξεων στο ερώτημα και εύρεση παρόμοιων λέξεων με Word2Vec,
+    εξαιρώντας τις ομόρριζες λέξεις.
+
     Args:
         query_text: Το κείμενο του ερωτήματος
         model: Το εκπαιδευμένο μοντέλο Word2Vec
         topn: Μέγιστος αριθμός παρόμοιων λέξεων ανά λέξη
         threshold: Κατώφλι ομοιότητας (0-1)
         min_word_length: Ελάχιστο μήκος λέξης για να θεωρηθεί σημαντική
-    
+
     Returns:
         tuple: (λίστα αρχικών tokens, λίστα με πληροφορίες επεκτάσιμων λέξεων)
     """
     tokens = word_tokenize(query_text.lower())
     pos_tags = pos_tag(tokens)
     stop_words = set(stopwords.words('english'))
+    stemmer = PorterStemmer() # <-- Δημιουργία stemmer
     expandable_info = []
-    
+
     for i, (word, tag) in enumerate(pos_tags):
         # Φιλτράρισμα λέξεων με βάση τα κριτήρια που θέσαμε
-        if (word in stop_words or 
-            len(word) < min_word_length or 
+        if (word in stop_words or
+            len(word) < min_word_length or
             not word.isalpha() or
             tag[0] not in ['N', 'J']):  # Μόνο ουσιαστικά και επίθετα
             continue
-        
+
         # Εύρεση παρόμοιων λέξεων από το Word2Vec
-        similar_words = []
+        similar_words_filtered = []
+        accepted_stems = set() # <-- Set για να παρακολουθούμε τα stems που έχουμε ήδη δεχτεί
+        original_word_stem = stemmer.stem(word) # <-- Stem της αρχικής λέξης
+        accepted_stems.add(original_word_stem)
+
         if word in model.wv:
-            word_matches = model.wv.most_similar(word, topn=topn*2)  # Ζητάμε περισσότερες για να έχουμε εφεδρείες
-            # Φιλτράρισμα με βάση το κατώφλι και αποφυγή διπλοτύπων
-            for w, score in word_matches:
-                if score >= threshold and w != word and w not in similar_words:
-                    similar_words.append((w, score))
-            
-            # Περιορισμός στις top-n
-            similar_words = similar_words[:topn]
-            
-            if similar_words:
-                expandable_info.append((i, word, similar_words))
-    
+            try:
+                # Ζητάμε περισσότερες για να έχουμε περιθώριο μετά το φιλτράρισμα
+                word_matches = model.wv.most_similar(word, topn=topn * 3)
+
+                # Φιλτράρισμα με βάση το κατώφλι, αποφυγή διπλοτύπων και ομόρριζων
+                for w, score in word_matches:
+                    if score < threshold or w == word or not w.isalpha():
+                        continue
+
+                    current_stem = stemmer.stem(w)
+
+                    # Έλεγχος αν το stem είναι ίδιο με της αρχικής λέξης ή με κάποιο ήδη αποδεκτό stem
+                    if current_stem in accepted_stems:
+                        continue
+
+                    # Αν περάσει τους ελέγχους, προσθέτουμε τη λέξη και το stem της
+                    similar_words_filtered.append((w, score))
+                    accepted_stems.add(current_stem)
+
+                    # Σταματάμε αν έχουμε βρει αρκετές (topn)
+                    if len(similar_words_filtered) >= topn:
+                        break
+
+            except KeyError:
+                 # Η λέξη μπορεί να υπάρχει στο wv αλλά να μην έχει neighbors (σπάνιο)
+                 pass
+
+            if similar_words_filtered:
+                expandable_info.append((i, word, similar_words_filtered))
+
     return tokens, expandable_info
 
 # Δημιουργία παραλλαγών ερωτημάτων
@@ -304,7 +329,7 @@ def run_search_with_variations(queries_path, model, output_dir, k_values=[20, 30
         
         print(f"Αποθήκευση {len(final_results_for_trec)} αποτελεσμάτων στο {output_file}...")
         with open(output_file, 'w', encoding='utf-8') as f:
-            for query_id, sorted_doc_scores in final_results_for_trec.items():
+            for query_id, sorted_doc_scores in sorted(final_results_for_trec.items()):
                 for rank, (doc_id, score) in enumerate(sorted_doc_scores, start=1):
                     # Μορφή: query_id Q0 doc_id rank score run_name
                     f.write(f"{query_id} Q0 {doc_id} {rank} {score:.6f} {run_name}\n")
@@ -347,17 +372,44 @@ def main():
         save_model(model, model_path)
     
     # Έλεγχος λειτουργίας του μοντέλου με μερικά παραδείγματα
-    print("\nΠαραδείγματα παρόμοιων λέξεων από το μοντέλο:")
-    example_words = ["covid", "treatment", "disease", "vaccine", "health"]
+    print("\nΠαραδείγματα παρόμοιων λέξεων από το μοντέλο (μετά το φιλτράρισμα ομόρριζων):")
+    example_words = ["origin", "covid", "treatment", "disease", "vaccine", "health"]
+    stemmer = PorterStemmer() # <-- Initialize stemmer here for example printing
+    topn_examples = 5
+
     for word in example_words:
         if word in model.wv:
-            similar_words = model.wv.most_similar(word, topn=5)
-            print(f"\nTop 5 λέξεις παρόμοιες με '{word}':")
-            for w, score in similar_words:
-                print(f"  {w}: {score:.4f}")
+            original_word_stem = stemmer.stem(word)
+            accepted_stems = {original_word_stem}
+            filtered_similar_words = []
+            try:
+                # Get more initially to allow for filtering
+                raw_similar_words = model.wv.most_similar(word, topn=topn_examples * 3)
+
+                for sim_word, score in raw_similar_words:
+                    if not sim_word.isalpha(): # Skip non-alphabetic words
+                        continue
+
+                    current_stem = stemmer.stem(sim_word)
+
+                    if current_stem not in accepted_stems:
+                        filtered_similar_words.append((sim_word, score))
+                        accepted_stems.add(current_stem)
+                        if len(filtered_similar_words) >= topn_examples:
+                            break # Stop when we have enough filtered words
+
+                print(f"\nTop {len(filtered_similar_words)} λέξεις παρόμοιες με '{word}' (μετά το φιλτράρισμα):")
+                if filtered_similar_words:
+                    for w, score in filtered_similar_words:
+                        print(f"  {w}: {score:.4f}")
+                else:
+                    print("  (Δεν βρέθηκαν μη ομόρριζες παρόμοιες λέξεις)")
+
+            except KeyError:
+                print(f"\nΗ λέξη '{word}' υπάρχει στο λεξιλόγιο αλλά δεν έχει παρόμοιες λέξεις.")
         else:
             print(f"\nΗ λέξη '{word}' δεν βρέθηκε στο λεξικό του μοντέλου.")
-    
+
     # Εκτέλεση αναζήτησης με τα επεκταμένα ερωτήματα
     print("\nΕκτέλεση αναζήτησης με επεκταμένα ερωτήματα από Word2Vec...")
     run_search_with_variations(QUERIES_PATH, model, output_dir)
