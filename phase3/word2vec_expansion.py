@@ -13,6 +13,9 @@ import gensim
 from gensim.models import Word2Vec
 import logging
 import numpy as np
+from itertools import product
+import matplotlib.pyplot as plt
+from sklearn.metrics.pairwise import cosine_similarity
 
 # Προσθήκη του γονικού καταλόγου στο path για να εισάγουμε από το search_engine.py
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -334,6 +337,218 @@ def run_search_with_variations(queries_path, model, output_dir, k_values=[20, 30
                     # Μορφή: query_id Q0 doc_id rank score run_name
                     f.write(f"{query_id} Q0 {doc_id} {rank} {score:.6f} {run_name}\n")
 
+# Νέα συνάρτηση αξιολόγησης του μοντέλου Word2Vec για P@5
+def evaluate_word2vec_model(model, evaluation_words=None):
+    """
+    Αξιολόγηση της ποιότητας του μοντέλου Word2Vec με βάση το P@5
+    
+    Χρησιμοποιεί προσομοίωση της μετρικής Precision@5 μετρώντας πόσο καλά το μοντέλο
+    εντοπίζει σχετικές αλλά διαφορετικές λέξεις στις πρώτες 5 θέσεις.
+    
+    Args:
+        model: Εκπαιδευμένο μοντέλο Word2Vec
+        evaluation_words: Λίστα λέξεων για αξιολόγηση, ή None για προεπιλεγμένες λέξεις
+
+    Returns:
+        float: Βαθμολογία αξιολόγησης του μοντέλου ως μέσο P@5 (υψηλότερη είναι καλύτερη)
+    """
+    if evaluation_words is None:
+        # Λέξεις σχετικές με ιατρικά/covid θέματα (προσαρμόστε ανάλογα με το dataset)
+        evaluation_words = ["covid", "virus", "disease", "treatment", "patient", 
+                           "health", "symptom", "study", "infection", "research"]
+
+    stemmer = PorterStemmer()
+    total_p5_score = 0
+    evaluated_words = 0
+
+    for word in evaluation_words:
+        if word not in model.wv:
+            continue
+
+        evaluated_words += 1
+        
+        # Μέτρηση Precision@5 - πόσες από τις πρώτες 5 λέξεις είναι διαφορετικές αλλά σχετικές
+        original_stem = stemmer.stem(word)
+        accepted_stems = {original_stem}
+        p5_hits = 0
+        
+        try:
+            # Ζητάμε μόνο τις top-5 λέξεις (+ επιπλέον για περιθώριο αν κάποιες φιλτραριστούν)
+            similar_words = model.wv.most_similar(word, topn=10)
+            examined_count = 0
+            
+            for sim_word, sim_score in similar_words:
+                # Φιλτράρισμα μη αλφαβητικών και παρόμοιων με χαμηλό σκορ
+                if not sim_word.isalpha() or sim_score < 0.6:
+                    continue
+                    
+                current_stem = stemmer.stem(sim_word)
+                
+                # Αν το stem είναι διαφορετικό, θεωρείται επιτυχία για το P@5
+                if current_stem not in accepted_stems:
+                    p5_hits += 1
+                    accepted_stems.add(current_stem)
+                
+                # Μετράμε μόνο τις πρώτες 5 έγκυρες λέξεις
+                examined_count += 1
+                if examined_count >= 5:
+                    break
+            
+            # Υπολογισμός του P@5 για αυτή τη λέξη
+            p5_score = p5_hits / 5.0
+            total_p5_score += p5_score
+            
+        except Exception as e:
+            # Σε περίπτωση σφάλματος, αυτή η λέξη δεν συνεισφέρει στο σκορ
+            pass
+        
+    # Επιστροφή μέσου όρου P@5 ή 0 αν καμία λέξη δεν αξιολογήθηκε
+    return total_p5_score / max(1, evaluated_words)
+
+# Συνάρτηση βελτιστοποίησης παραμέτρων του Word2Vec
+def optimize_word2vec_parameters(tokenized_corpus, output_dir, test_params=False):
+    """
+    Βελτιστοποίηση παραμέτρων του Word2Vec με δοκιμή διαφορετικών συνδυασμών
+    
+    Args:
+        tokenized_corpus: Προεπεξεργασμένο corpus για εκπαίδευση
+        output_dir: Κατάλογος για αποθήκευση αποτελεσμάτων
+        test_params: Αν True, δοκιμάζει μόνο λίγες τιμές για σύντομο τεστ
+    
+    Returns:
+        tuple: (Βέλτιστο μοντέλο, λεξικό με τις βέλτιστες παραμέτρους)
+    """
+    print("\nΒελτιστοποίηση παραμέτρων Word2Vec...")
+    
+    # Ορισμός παραμέτρων προς βελτιστοποίηση
+    if test_params:
+        # Περιορισμένες τιμές για γρήγορο τεστ
+        vector_sizes = [50, 100] 
+        window_sizes = [3, 5]
+        sg_values = [0, 1]  # 0: CBOW, 1: Skip-gram
+        epochs_values = [2]
+    else:
+        # Πλήρες σύνολο τιμών για εύρεση βέλτιστων παραμέτρων
+        vector_sizes = [50, 100, 200, 300] 
+        window_sizes = [3, 5, 7, 10]
+        sg_values = [0, 1]  # 0: CBOW, 1: Skip-gram
+        epochs_values = [3, 5]
+    
+    # Σταθερές παράμετροι
+    min_count = 5
+    workers = 4
+    
+    # Αποθήκευση αποτελεσμάτων
+    results = []
+    best_score = -1
+    best_model = None
+    best_params = None
+    
+    total_combinations = len(vector_sizes) * len(window_sizes) * len(sg_values) * len(epochs_values)
+    print(f"Δοκιμή {total_combinations} συνδυασμών παραμέτρων...")
+    
+    # Αντιγραφή του corpus για αποφυγή προβλημάτων
+    train_data = [tokens.copy() for tokens in tokenized_corpus]
+    
+    # Δοκιμή όλων των συνδυασμών παραμέτρων
+    for vector_size, window, sg, epochs in tqdm(
+        product(vector_sizes, window_sizes, sg_values, epochs_values), 
+        total=total_combinations,
+        desc="Βελτιστοποίηση παραμέτρων"
+    ):
+        try:
+            # Εκπαίδευση μοντέλου με τις τρέχουσες παραμέτρους
+            model = Word2Vec(
+                sentences=train_data,
+                vector_size=vector_size,
+                window=window,
+                min_count=min_count,
+                workers=workers,
+                sg=sg,
+                epochs=epochs
+            )
+            
+            # Αξιολόγηση μοντέλου
+            score = evaluate_word2vec_model(model)
+            
+            # Αποθήκευση αποτελεσμάτων
+            param_results = {
+                'vector_size': vector_size,
+                'window': window,
+                'sg': sg,
+                'epochs': epochs,
+                'architecture': 'Skip-gram' if sg == 1 else 'CBOW',
+                'score': score
+            }
+            results.append(param_results)
+            
+            # Ενημέρωση του καλύτερου μοντέλου αν είναι απαραίτητο
+            if score > best_score:
+                best_score = score
+                best_model = model
+                best_params = param_results.copy()
+                
+            print(f"Παράμετροι: vector_size={vector_size}, window={window}, sg={sg} ({param_results['architecture']}), epochs={epochs} → Βαθμολογία: {score:.4f}")
+            
+        except Exception as e:
+            print(f"Σφάλμα κατά την εκπαίδευση του μοντέλου με παραμέτρους vector_size={vector_size}, window={window}, sg={sg}, epochs={epochs}: {e}")
+    
+    # Αποθήκευση αποτελεσμάτων σε αρχείο
+    results_path = os.path.join(output_dir, "word2vec_parameter_optimization_results.json")
+    with open(results_path, 'w', encoding='utf-8') as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+    
+    # Δημιουργία διαγράμματος για CBOW vs Skip-gram
+    plt.figure(figsize=(12, 6))
+    
+    # Οργάνωση αποτελεσμάτων ανά αρχιτεκτονική
+    cbow_results = [r for r in results if r['sg'] == 0]
+    skipgram_results = [r for r in results if r['sg'] == 1]
+    
+    # Δημιουργία scatter plot για κάθε αρχιτεκτονική
+    plt.scatter(
+        [r['vector_size'] for r in cbow_results], 
+        [r['score'] for r in cbow_results],
+        label='CBOW', marker='o', alpha=0.7
+    )
+    plt.scatter(
+        [r['vector_size'] for r in skipgram_results], 
+        [r['score'] for r in skipgram_results],
+        label='Skip-gram', marker='x', alpha=0.7
+    )
+    
+    plt.title('Επίδοση Μοντέλων Word2Vec με Διαφορετικές Παραμέτρους')
+    plt.xlabel('Μέγεθος Διανύσματος (vector_size)')
+    plt.ylabel('Βαθμολογία Αξιολόγησης')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.6)
+    
+    # Σημείωση του καλύτερου μοντέλου στο διάγραμμα
+    if best_params:
+        plt.annotate(
+            f"Βέλτιστο: {best_params['architecture']}, VS={best_params['vector_size']}, W={best_params['window']}",
+            xy=(best_params['vector_size'], best_params['score']),
+            xytext=(10, -20),
+            textcoords='offset points',
+            arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=.5')
+        )
+    
+    # Αποθήκευση διαγράμματος
+    chart_path = os.path.join(output_dir, "word2vec_optimization_chart.png")
+    plt.tight_layout()
+    plt.savefig(chart_path)
+    
+    print(f"\nΒέλτιστες παράμετροι:")
+    print(f"Αρχιτεκτονική: {best_params['architecture']} (sg={best_params['sg']})")
+    print(f"Μέγεθος διανύσματος: {best_params['vector_size']}")
+    print(f"Μέγεθος παραθύρου: {best_params['window']}")
+    print(f"Εποχές: {best_params['epochs']}")
+    print(f"Βαθμολογία: {best_params['score']:.4f}")
+    print(f"Αποτελέσματα αποθηκεύτηκαν στο {results_path}")
+    print(f"Διάγραμμα αποθηκεύτηκε στο {chart_path}")
+    
+    return best_model, best_params
+
 # Κύρια συνάρτηση
 def main():
     # Ρύθμιση καταλόγων
@@ -344,22 +559,66 @@ def main():
     os.makedirs(model_dir, exist_ok=True)
     
     model_path = os.path.join(model_dir, "word2vec_model.bin")
+    optimized_model_path = os.path.join(model_dir, "word2vec_model_optimized.bin")
     
     # Κατέβασμα NLTK πόρων
     download_nltk_resources()
     
-    # Έλεγχος αν υπάρχει ήδη εκπαιδευμένο μοντέλο
-    model = load_model(model_path)
+    # Φόρτωση δεδομένων και προεπεξεργασία (αυτό χρειάζεται είτε για εκπαίδευση είτε για βελτιστοποίηση)
+    print("Φόρτωση και προεπεξεργασία του corpus...")
+    documents = load_corpus_from_jsonl(CORPUS_PATH)
+    tokenized_corpus = preprocess_corpus(documents)
     
+    # Προσθήκη παραμέτρων γραμμής εντολών για βελτιστοποίηση
+    import argparse
+    parser = argparse.ArgumentParser(description='Word2Vec Expansion and Optimization')
+    parser.add_argument('--optimize', action='store_true', help='Perform parameter optimization')
+    parser.add_argument('--test-params', action='store_true', help='Test only a few parameter combinations (faster)')
+    parser.add_argument('--use-optimized', action='store_true', help='Use the optimized model if available')
+    args = parser.parse_args()
+    
+    if args.optimize:
+        print("\n=== Εκτέλεση βελτιστοποίησης παραμέτρων Word2Vec ===")
+        best_model, best_params = optimize_word2vec_parameters(tokenized_corpus, output_dir, args.test_params)
+        
+        if best_model:
+            # Αποθήκευση του βέλτιστου μοντέλου
+            save_model(best_model, optimized_model_path)
+            
+            # Αποθήκευση των βέλτιστων παραμέτρων
+            params_path = os.path.join(model_dir, "best_params.json")
+            with open(params_path, 'w', encoding='utf-8') as f:
+                json.dump(best_params, f, ensure_ascii=False, indent=2)
+            
+            model = best_model
+        else:
+            print("Η βελτιστοποίηση δεν βρήκε έγκυρο μοντέλο. Προσπάθεια φόρτωσης ή εκπαίδευσης βασικού μοντέλου.")
+            model = load_model(model_path)
+    elif args.use_optimized and os.path.exists(optimized_model_path):
+        # Φόρτωση του βελτιστοποιημένου μοντέλου αν υπάρχει και ζητήθηκε
+        print("\nΦόρτωση βελτιστοποιημένου μοντέλου...")
+        model = load_model(optimized_model_path)
+        
+        # Ανάκτηση και εμφάνιση των βέλτιστων παραμέτρων
+        params_path = os.path.join(model_dir, "best_params.json")
+        if os.path.exists(params_path):
+            with open(params_path, 'r', encoding='utf-8') as f:
+                best_params = json.load(f)
+            print(f"Βέλτιστες παράμετροι:")
+            print(f"Αρχιτεκτονική: {best_params['architecture']} (sg={best_params['sg']})")
+            print(f"Μέγεθος διανύσματος: {best_params['vector_size']}")
+            print(f"Μέγεθος παραθύρου: {best_params['window']}")
+            print(f"Εποχές: {best_params['epochs']}")
+            print(f"Βαθμολογία: {best_params['score']:.4f}")
+    else:
+        # Κανονική ροή εκτέλεσης: Έλεγχος για υπάρχον μοντέλο ή εκπαίδευση νέου
+        model = load_model(model_path)
+    
+    # Αν δεν έχουμε μοντέλο ακόμα, εκπαίδευση με προεπιλεγμένες παραμέτρους
     if model is None:
-        print("Δεν βρέθηκε εκπαιδευμένο μοντέλο. Εκκίνηση εκπαίδευσης...")
+        print("Δεν βρέθηκε εκπαιδευμένο μοντέλο. Εκκίνηση εκπαίδευσης με προεπιλεγμένες παραμέτρους...")
         
-        # Φόρτωση και προεπεξεργασία του corpus
-        documents = load_corpus_from_jsonl(CORPUS_PATH)
-        tokenized_corpus = preprocess_corpus(documents)
-        
-        # Εκπαίδευση του μοντέλου Word2Vec
-        # Χρησιμοποιείται Skip-gram (sg=1) που συνήθως δίνει καλύτερα αποτελέσματα για συνώνυμα
+        # Εκπαίδευση του μοντέλου Word2Vec με προεπιλεγμένες παραμέτρους
         model = train_word2vec_model(tokenized_corpus, 
                                      vector_size=100,  # Μέγεθος διανυσμάτων
                                      window=5,         # Μέγεθος παραθύρου context

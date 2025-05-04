@@ -1,0 +1,8 @@
+{
+  "vector_size": 50,
+  "window": 3,
+  "sg": 1,
+  "epochs": 3,
+  "architecture": "Skip-gram",
+  "score": 1.0
+}
