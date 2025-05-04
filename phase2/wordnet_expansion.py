@@ -12,7 +12,7 @@ import itertools # Import itertools for combinations
 
 # Add parent directory to path to import from search_engine.py
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from search_engine import ElasticSearchEngine, QUERIES_PATH, ES_HOST, INDEX_NAME
+from phase1.search_engine import ElasticSearchEngine, QUERIES_PATH, ES_HOST, INDEX_NAME
 
 # Download necessary NLTK resources if they're not already downloaded
 def download_nltk_resources():

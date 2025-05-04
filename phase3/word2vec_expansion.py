@@ -16,7 +16,7 @@ import numpy as np
 
 # Προσθήκη του γονικού καταλόγου στο path για να εισάγουμε από το search_engine.py
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from search_engine import ElasticSearchEngine, QUERIES_PATH, CORPUS_PATH, ES_HOST, INDEX_NAME
+from phase1.search_engine import ElasticSearchEngine, QUERIES_PATH, CORPUS_PATH, ES_HOST, INDEX_NAME
 
 # Ρύθμιση του logging
 logging.basicConfig(format='%(asctime)s : %(levelname)s : %(message)s', level=logging.INFO)
