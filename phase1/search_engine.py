@@ -1,6 +1,6 @@
 import json
 import os
-from elasticsearch import Elasticsearch, helpers
+from elasticsearch import Elasticsearch, exceptions, helpers
 from tqdm import tqdm
 import ssl
 import urllib3
@@ -318,6 +318,36 @@ class ElasticSearchEngine:
         result = self.es.search(index=self.index_name, body=query)
         return result["hits"]["hits"]
     
+    def search_custom_query(self, query_dsl, k=50):
+        """
+        Executes a custom query DSL against Elasticsearch.
+
+        Args:
+            query_dsl (dict): The Elasticsearch Query DSL.
+            k (int): Number of top results to retrieve.
+
+        Returns:
+            list: A list of search hits, or an empty list in case of an error.
+        """
+        if not self.es.ping():
+            print("Connection to Elasticsearch failed.")
+            return []
+        try:
+            response = self.es.search(
+                index=self.index_name,
+                body={
+                    "query": query_dsl,
+                    "size": k
+                }
+            )
+            return response['hits']['hits']
+        except exceptions.NotFoundError:
+            print(f"Index '{self.index_name}' not found.")
+            return []
+        except Exception as e:
+            print(f"An error occurred during custom search: {e}")
+            return []
+
     def search_all_queries(self, queries_path, k=20):
         """Αναζήτηση για όλα τα ερωτήματα του dataset"""
         if not os.path.exists(queries_path):
@@ -378,12 +408,15 @@ def main():
         print("Δεν είναι δυνατή η σύνδεση με τον ElasticSearch server. Βεβαιωθείτε ότι ο server είναι σε λειτουργία.")
         return
     
-    # Πάντα δημιουργία/επανεισαγωγή του ευρετηρίου
-    print("Δημιουργία/Επανεισαγωγή ευρετηρίου...")
-    es_engine.create_index(delete_if_exists=True)
-    
-    # Εισαγωγή εγγράφων στο ευρετήριο με parallel_bulk
-    es_engine.index_documents(CORPUS_PATH, thread_count=8)  # Αύξηση των threads για ταχύτερη εισαγωγή
+    # Έλεγχος αν το ευρετήριο υπάρχει και είναι πλήρες
+    if not es_engine.index_exists_and_complete(CORPUS_PATH):
+        print("Το ευρετήριο δεν υπάρχει ή είναι ελλιπές. Δημιουργία/Επανεισαγωγή ευρετηρίου...")
+        es_engine.create_index(delete_if_exists=True) # delete_if_exists=True για να διασφαλιστεί καθαρή επανεισαγωγή αν είναι ελλιπές
+        
+        # Εισαγωγή εγγράφων στο ευρετήριο με parallel_bulk
+        es_engine.index_documents(CORPUS_PATH, thread_count=8)
+    else:
+        print("Το ευρετήριο υπάρχει ήδη και είναι πλήρες. Παράλειψη δημιουργίας/εισαγωγής.")
 
     # Εκτέλεση αναζήτησης για όλα τα ερωτήματα
     for k in [20, 30, 50]:
